@@ -44,6 +44,13 @@ the_office_sentiment <- tidy_tokens %>%
   spread(sentiment, n, fill = 0) %>%
   mutate(sentiment = positive - negative)
 
+tidy_tokens %>%
+  inner_join(get_sentiments("bing")) %>%
+  filter(speaker == "michael") %>% 
+  count(season, sentiment) %>%
+  spread(sentiment, n, fill = 0) %>%
+  mutate(sentiment = positive - negative)
+
 ggplot(the_office_sentiment, aes(episode, sentiment, fill = season)) +
   geom_col(show.legend = FALSE) +
   facet_wrap(~ season, ncol = 2, scales = "free_x")
@@ -134,6 +141,35 @@ tidy_tokens %>%
   acast(word ~ sentiment, value.var = "n", fill = 0) %>%
   comparison.cloud(colors = c("gray20", "gray80"),
                    max.words = 100)
+
+# how does character sentiment change over season
+tidy_tokens %>%
+  inner_join(get_sentiments("bing")) %>%
+  filter(speaker %in% main_characters) %>%
+  mutate_at(vars(speaker), factor, levels = main_characters) %>%
+  count(season, speaker, sentiment) %>%
+  spread(sentiment, n, fill = 0) %>%
+  mutate(sentiment = positive - negative) %>% 
+  ggplot(aes(x = season, y = sentiment, color = speaker)) +
+  geom_point() +
+  geom_line() +
+  facet_wrap(~ speaker) +
+  scale_x_continuous(breaks = seq(1, 9, 1))
+
+# sentiment by episode for each season; michael has the largest range of sentiment over time
+tidy_tokens %>%
+  inner_join(get_sentiments("bing")) %>%
+  filter(speaker %in% main_characters) %>%
+  mutate_at(vars(speaker), factor, levels = main_characters) %>%
+  count(season, episode, speaker, sentiment) %>%
+  spread(sentiment, n, fill = 0) %>%
+  mutate(sentiment = positive - negative) %>% 
+  ggplot(aes(x = as.character(season), y = sentiment, color = speaker)) +
+  geom_boxplot() +
+  facet_wrap(c("speaker")) +
+  scale_x_continuous(breaks = seq(1, 9, 1))
+  
+median(c(-18, 5, 8, -9, -1, 12))
 
 # which seasons were the most negative/positive
 
@@ -226,12 +262,56 @@ tidy_sentences <- mod_data %>%
 
 thats_what_she_said <- tidy_sentences %>% 
   group_by(speaker) %>% 
-  filter(sentence %like% "that(')?s what she said") %>% 
+  filter(str_detect(sentence, "that(')?s what she( said)?(?! would)")) %>% 
   count(sort = TRUE) 
 
 tidy_sentences %>% 
   group_by(season) %>% 
-  filter(sentence %like% "that(')?s what she said") %>% 
+  filter(str_detect(sentence, "that(')?s what she( said)?(?! would)")) %>% 
   count() 
 
-# get 
+# get sentence before that's what she said
+tidy_sentences <- rowid_to_column(tidy_sentences, var = "sentence_id")
+
+  twss_sentence <- tidy_sentences %>% 
+    filter(sentence %like% "^that(')?s what she( said)?") %>% 
+    pull(sentence_id)
+  
+  twss_line <- tidy_sentences %>% 
+    filter(sentence %like% "^that(')?s what she( said)?") %>% 
+    pull(line)
+  
+  line_before <- twss_line - 1
+  
+  sentence_before <- twss_sentence - 1
+  
+  sentence_before_twss <- tidy_sentences %>% 
+    filter(sentence_id %in% sentence_before) 
+  
+  line_before_twss <- tidy_sentences %>% 
+    filter(line %in% line_before)
+  
+# one of these is [dwight putting grapes in his mouth] 11981 and another is second cindy whispering in michael's ear 20816 and Mr. Schneider: And you were directly under her the entire time? Mr. Scott: 
+  # and I'm not saying it won't be hard. But we can make it work.
+  # And in the future, if I want to say something funny or witty or do an impression, I will no longer, ever, do any of those things.
+  # Jim: Does that include 'That's What She Said'?
+  # I can't stay on top of you 24/7 - does he say it here?
+  # Hold it in your mouth if you can't swallow weight loss - did he say it?
+  # 46655 that's what he said
+  # I can't force you to go down but I can entice you cafe disco did he say it
+correct_sentence_before_twss <- c(4235, 4337, 4338, 4339, 8305, 9832, 13965, 15298, 17610, 22176, 24100, 24225, 26023, 28165, 30242, 32684, 34659, 34665, 34917, 34919, 34932, 35673, 36960, 40069, 41485, 41998, 42864, 46655, 48741, 63636, 71371, 74304, 75904, 75905, 78720, 96061, 106875)
+almost_sentence_before_twss <- c(4238, 38566, 54538)
+
+final_sentence_before_twss <- tidy_sentences %>% 
+  filter(sentence_id %in% correct_sentence_before_twss)
+
+final_almost_sentence_before_twss <- tidy_sentences %>% 
+  filter(sentence_id %in% almost_sentence_before_twss)
+c(correct_sentence_before_twss, almost_sentence_before_twss)
+# that's what she said was said 39 times. One of those times includes jim asking a question about it, so not really in the spirit of twss
+# another of those times inclue the court reporter reading back what michael had said
+# it was almost said 3 more times by michael but either he cut himself off or jim cut him off
+all_sentences_before_twss <- tidy_sentences %>% 
+  filter(sentence_id %in% c(correct_sentence_before_twss, almost_sentence_before_twss))
+
+# sentiment by sentence using coreNLP backend
