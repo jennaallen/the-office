@@ -153,6 +153,11 @@ scale_x_reordered <- function(..., sep = "___") {
   ggplot2::scale_x_discrete(labels = function(x) gsub(reg, "", x), ...)
 }
 
+scale_y_reordered <- function(..., sep = "___") {
+  reg <- paste0(sep, ".+$")
+  ggplot2::scale_y_discrete(labels = function(x) gsub(reg, "", x), ...)
+}
+
 # plot top 10 absolute word counts by main character
 top_10_word_freq_character <- tidy_tokens %>%
   filter(speaker %in% main_characters) %>%

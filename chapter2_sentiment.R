@@ -1,4 +1,6 @@
 library(wordcloud)
+library(data.table)
+library(reshape2)
 
 # chapter 2: sentiment analysis
 
@@ -213,3 +215,23 @@ tidy_tokens %>%
   left_join(wordcounts_episode, by = c("season", "episode")) %>%
   mutate(ratio = positivewords/words) %>% 
   arrange(desc(ratio))
+
+# parse by sentence instead of word
+
+tidy_sentences <- mod_data %>%
+  select(line = id, line_text_mod, everything(), -line_text, -actions, -deleted) %>% 
+  unnest_tokens(sentence, line_text_mod, token = "sentences")
+
+# how many times was "that's what she said" said
+
+thats_what_she_said <- tidy_sentences %>% 
+  group_by(speaker) %>% 
+  filter(sentence %like% "that(')?s what she said") %>% 
+  count(sort = TRUE) 
+
+tidy_sentences %>% 
+  group_by(season) %>% 
+  filter(sentence %like% "that(')?s what she said") %>% 
+  count() 
+
+# get 
