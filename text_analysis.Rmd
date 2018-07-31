@@ -1,0 +1,589 @@
+---
+title: "Text Analytics: Every Line from The Office"
+output: html_document
+---
+
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message = FALSE,
+                      warning = FALSE)
+```
+
+
+As a part of the [R4DS June Challenge](https://www.jessemaegan.com/post/r4ds-june-challenge-summer-of-data-science-2018/) and the "Summer of Data Science" Twitter initiative started by [Data Science Renee](https://twitter.com/BecomingDataSci), I decided to improve my text mining skills by working my way through [Tidy Text Mining with R](https://www.tidytextmining.com/) by Julia Silge and David Robinson. I wanted a fun dataset that I was fairly familiar with to use as I worked my way through the book, so I decided to use every line from The Office. I could write an entire blog post about why I love The Office and why it is such a great show, but I will refrain. The good thing about using this dataset is that I have seen every episode (except for seasons 8 and 9) multiple times, needless to say, I'm very familiar with it.
+
+So, let's get started!
+
+```{r}
+library(tidyverse)
+library(tidytext)
+library(ggthemes)
+library(scales)
+library(googlesheets)
+library(igraph)
+library(ggraph)
+library(widyr)
+library(psych)
+library(kableExtra)
+library(knitr)
+library(plotly)
+library(ggcorrplot)
+```
+
+# Getting and Cleaning the Data
+Fortunately, someone created a [googlesheet](https://docs.google.com/spreadsheets/d/18wS5AAwOh8QO95RwHLS95POmSNKA2jjzdt0phrxeAE0/edit#gid=747974534) sourced from [officequotes.net](http://www.officequotes.net/topQuotes.php). 
+
+```{r get-raw-data}
+# get key for data sheet
+sheet_key <- gs_ls("the-office-lines") %>% 
+  pull(sheet_key)
+
+# register sheet to access it
+reg <- sheet_key %>%
+  gs_key()
+
+# read sheet data into R
+raw_data <- reg %>%
+  gs_read(ws = "scripts")
+```
+
+```{r show-raw-data, echo = FALSE}
+ kable(head(raw_data), "html") %>% 
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+This data, like the majority of data isn't perfect, but its in pretty good shape. There are some clean up steps we need to do:
+
+1. Filter out deleted scenes
+2. Remove text in brackets ([]) and put in a new column called actions
+3. There are 4000+ instances of ??? found in the data mainly in the last two seasons. The ??? replaces ... - ' and ". For now I'm just going to replace all instances with ' since that seems to be the majority of the cases
+4. Change speaker to lower case since there is some inconsistent capitalization
+5. Some entries for speakers have actions ([]), which I'll remove
+6. Fix mispellings in the speaker field (e.g. Micheal instead of Michael)
+7. Remove unnecessary punctuation in the speaker field (e.g. Dwight:)
+
+```{r}
+mod_data <- raw_data %>% 
+  filter(deleted == "FALSE") %>% 
+  mutate(actions = str_extract_all(line_text, "\\[.*?\\]"),
+         line_text_mod = str_trim(str_replace_all(line_text, "\\[.*?\\]", ""))) %>% 
+  mutate_at(vars(line_text_mod), funs(str_replace_all(., "���","'"))) %>% 
+  mutate_at(vars(speaker), funs(tolower)) %>% 
+  mutate_at(vars(speaker), funs(str_trim(str_replace_all(., "\\[.*?\\]", "")))) %>% 
+  mutate_at(vars(speaker), funs(str_replace_all(., "micheal|michel|michae$", "michael")))
+```
+
+# Exploring the Data
+```{r total-episodes}
+total_episodes <- mod_data %>% 
+  unite(season_ep, season, episode, remove = FALSE) %>% 
+  summarise(num_episodes = n_distinct(season_ep)) %>% 
+  as.integer()
+
+total_episodes
+```
+
+Searching around on the interwebs indicates that there were 201 episodes of the office, however the data I have contains 186 episodes. Wikipedia counts some episodes like "A Benihana Christmas" as two, but I'm not sure why. The data from officequotes.net pretty much lines up with the epsisode breakdown on IMdB with the exception of season 6. Officequotes.net counts Niagra parts 1 & 2 as one episode and The Delivery parts 1 & 2 as one episode instead of two. Since, I am working with the officequestions.net data, I'm going with the idea that there were 186 episodes total.
+
+```{r breakdown-of-episodes-scenes}
+# proportion of episodes each character was in
+episode_proportion <- mod_data %>% 
+  unite(season_ep, season, episode, remove = FALSE) %>% 
+  group_by(speaker) %>% 
+  summarise(num_episodes = n_distinct(season_ep)) %>% 
+  mutate(proportion = round((num_episodes / total_episodes) * 100, 1)) %>% 
+  arrange(desc(num_episodes))
+
+total_scenes <- mod_data %>% 
+  unite(season_ep_scene, season, episode, scene, remove = FALSE) %>% 
+  summarise(num_scenes = n_distinct(season_ep_scene)) %>% 
+  as.integer()
+
+# proportion of scenes each character was in 
+scene_proportion <- mod_data %>% 
+  unite(season_ep_scene, season, episode, scene, remove = FALSE) %>% 
+  group_by(speaker) %>% 
+  summarise(num_scenes = n_distinct(season_ep_scene)) %>% 
+  mutate(proportion = round((num_scenes / total_scenes) * 100, 1)) %>% 
+  arrange(desc(num_scenes))
+```
+
+Dwight was the only character in every episode
+```{r show-episode-proportion, echo = FALSE}
+ kable(episode_proportion %>% 
+         filter(!(speaker %in% c("all", "everyone")), proportion > 9), "html") %>% 
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+```{r show-scene-proportion, echo = FALSE}
+ kable(scene_proportion %>% 
+         filter(proportion > 1), "html") %>% 
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+## Determining the main characters
+
+For parts of my analysis, I wanted to look at the main characters, but beyond Michael, Dwight, Jim, and Pam, determining who the "main characters" are is a little challenging. There are lots of ancillary characters that lurk in the background or get their own plot lines later in the show. I defined the main characters based on % of lines for the entire series. I included a character as a main character if they had at least 1% of all the lines. Yes, this excludes characters like Nellie and Robert California who played larger roles late in the series, but I wasn't a big fan of those seasons, so it's ok.
+
+```{r lines}
+# which characters had the most lines
+# this is for all lines and episodes; not every character was in every episode/season
+
+line_proportion <- mod_data %>% 
+  count(speaker) %>% 
+  mutate(proportion = round((n / sum(n)) * 100, 1)) %>% 
+  arrange(desc(n))
+
+# defining main characters based on line proportion
+main_characters <- factor(line_proportion %>% 
+                            filter(proportion >= 1) %>% 
+                            pull(speaker) %>% 
+                            fct_inorder()
+                          )
+
+line_proportion_by_season <- mod_data %>% 
+  group_by(season) %>% 
+  count(speaker) %>% 
+  mutate(proportion = round((n / sum(n)) * 100, 1)) %>% 
+  arrange(season, desc(proportion))
+
+office_colors <- c("#19c0f4", "#daad62", "#3c3a47", "#9c311f", "#162737", "#70aa8e", "#947192", "#b7787b", "#038e93", "#36385a", "#7f9ca0", "#8c2d45", "#870e1b", "#807d69", "#005b59", "#9d9ba0", "#7c3814", "#5da8bd")
+
+line_proportion_over_time <- line_proportion_by_season %>% 
+  filter(speaker %in% main_characters) %>% 
+  ggplot(aes(x = season, y = proportion, color = speaker, label = proportion)) +
+  geom_point(size = 2) +
+  geom_line() +
+  scale_x_continuous(breaks = seq(1, 9, 1)) +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  ylab("% of lines") +
+  facet_wrap(~ factor(speaker, levels = main_characters), ncol = 3) +
+  geom_text(vjust = -1.2, size = 3.5) +
+  ylim(0, 50) +
+  scale_color_manual(values = office_colors)
+  
+
+line_proportion_over_time
+```
+
+# Text Analytics
+
+## Word Frequencies
+
+I'll start by tokenizing the text into words and removing the standard stop words (very common words that only add noise to the analysis). 
+
+```{r tokenize}
+tidy_tokens <- mod_data %>%
+  select(line = id, line_text_mod, everything(), -line_text, -actions, -deleted) %>% 
+  unnest_tokens(word, line_text_mod, strip_numeric = TRUE) %>%
+  mutate_at(vars(word), funs(str_replace_all(., "'s$", ""))) %>% 
+  anti_join(stop_words, by = "word")
+```
+
+
+```{r echo = FALSE}
+top_30_word_freq <- tidy_tokens %>%
+  count(word, sort = TRUE) %>% 
+  mutate(proportion = round(n / sum(n), 3)) %>%
+  top_n(30, proportion) %>%
+  mutate(word = reorder(word, proportion)) %>%
+  ggplot(aes(word, percent(proportion))) +
+  geom_col(fill = "#19c0f4") +
+  xlab(NULL) +
+  ylab("Word Frequency") +
+  coord_flip() +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+top_30_word_freq
+```
+
+Looking at the most frequent words reveiled words like "yeah", "hey", "uh", "um", "huh", "hmm", and "ah." I'm going to add these to the stop words and remove them from the analysis.
+
+```{r}
+custom_stop_words <- bind_rows(data_frame(word = c("yeah", "hey", "uh", "um", "huh", "hmm", "ah", "umm", "uhh", "gonna", "na", "ha", "gotta"), 
+                                          lexicon = c("custom")), 
+                               stop_words)
+
+tidy_tokens_no_stop <- tidy_tokens %>% 
+  anti_join(custom_stop_words, by = "word")
+
+```
+
+After I removed those stop words, I was interested in looking at word frequencies by character.
+
+```{r}
+reorder_within <- function(x, by, within, fun = mean, sep = "___", ...) {
+  new_x <- paste(x, within, sep = sep)
+  stats::reorder(new_x, by, FUN = fun)
+}
+
+scale_x_reordered <- function(..., sep = "___") {
+  reg <- paste0(sep, ".+$")
+  ggplot2::scale_x_discrete(labels = function(x) gsub(reg, "", x), ...)
+}
+
+# plot top 10 highest word frequencies by character
+top_10_word_freq_character <- tidy_tokens_no_stop %>%
+  filter(speaker %in% main_characters) %>%
+  count(speaker, word, sort = TRUE) %>% 
+  group_by(speaker) %>% 
+  mutate(proportion = round(n / sum(n), 3)) %>%
+  top_n(10, proportion) %>% 
+  ggplot(aes(reorder_within(word, proportion, speaker), percent(proportion), fill = speaker)) +
+  geom_col() +
+  scale_x_reordered() +
+  xlab(NULL) +
+  ylab("Word Frequency") +
+  coord_flip() +
+  theme_minimal() + 
+  facet_wrap(~ factor(speaker, levels = main_characters), scales = "free", ncol = 6) + 
+  theme(legend.position = "none") +
+  scale_fill_manual(values = office_colors)
+
+top_10_word_freq_character
+```
+
+Michael is a top word for almost all of the characters. Given he is the main character and interacts with everyone that isn't too surprising. A lot of characters use the word "time", "god", guy(s), love, and office frequently. The word "party" is used frequently by Angela and Phyllis because they are on the party planning committee. 
+
+These word frequencies are interesting, but we see a lot of the same words for different characters. If we want to understand the words that are unique to each character, we can use tf-idf. The tf-idf is defined as term frequency (tf) multiplied by inverse document frequency (idf). This gives us a measure of how unique a word is to a given character. Calculating tf-idf attempts to find the words that are important (i.e., common) for a given character, but not too common across all characters.
+
+```{r}
+tidy_tokens_tf_idf <- tidy_tokens %>%
+  count(speaker, word, sort = TRUE) %>%
+  ungroup()
+
+total_words <- tidy_tokens_tf_idf %>%
+  group_by(speaker) %>% 
+  summarize(total = sum(n))
+
+tidy_tokens_tf_idf <- tidy_tokens_tf_idf %>% 
+  left_join(total_words, by = "speaker") %>% 
+  filter(speaker %in% main_characters) %>% 
+  bind_tf_idf(word, speaker, n)
+
+top_10_tf_idf_character <- tidy_tokens_tf_idf %>%
+  arrange(desc(tf_idf)) %>%
+  group_by(speaker) %>% 
+  top_n(10, tf_idf) %>% 
+  ungroup %>%
+  ggplot(aes(reorder_within(word, tf_idf, speaker), tf_idf, fill = speaker)) +
+  geom_col(show.legend = FALSE) +
+  scale_x_reordered() +
+  labs(x = NULL, y = "tf-idf") +
+  facet_wrap(~ factor(speaker, levels = main_characters), scales = "free") +
+  coord_flip() +
+  scale_fill_manual(values = office_colors)
+
+top_10_tf_idf_character
+```
+
+This is amazing and fun to see! There are so many good character nuances revealed. A lot of characters children show up here Cece (Pam), Astrid (Jan), Melissa (Stanley), Phillip (Angela), etc. There are also several love interests that appear. We also see that lyrics from Angela's favorite Christmas song *Little Drummer Boy* bubble to the top and her love of cats. Pam's work as an artist shows with the words mural, paint, and defaced (the mural was defaced). Ethics and ethical indicate Holly's work in HR. Overall, this gives us some good insight into each character's uniqueness. 
+
+Now that we've discovered differences between characters, let's look at similarities. How correlated are the word frequencies between each character of The Office?
+
+```{r}
+frequency_by_character <- tidy_tokens_no_stop %>%
+  filter(speaker %in% main_characters) %>% 
+  count(speaker, word, sort = TRUE) %>% 
+  group_by(speaker) %>% 
+  mutate(proportion = n / sum(n)) %>% 
+  select(-n) %>% 
+  spread(speaker, proportion) 
+
+cor_all <- corr.test(frequency_by_character[, -1], adjust = "none")
+cor_plot <- ggcorrplot(cor_all[["r"]], hc.order = TRUE, type = "lower",
+   colors = c("#E46726", "white", "#6D9EC1"),
+   lab = TRUE,
+   lab_size = 2)
+
+cor_plot
+```
+
+I was a little surprised to find that the two characters who's words are most correlated are Dwight and Pam. Michael and Jim are a close second.
+
+Jan and Darryl have the least similar vocabularies.
+
+Given this info, I wanted to see which words Dwight and Pam shared.
+
+```{r}
+pam_dwight_words <- frequency_by_character %>% 
+  select(word, pam, dwight) %>% 
+  ggplot(aes(x = pam, y = dwight, color = abs(pam - dwight), label = word)) +
+  geom_abline(color = "gray40", lty = 2) +
+  geom_jitter(alpha = 0.1, size = 2.5, width = 0.3, height = 0.3) +
+  #geom_text(check_overlap = TRUE) +
+  scale_x_log10(labels = percent_format()) +
+  scale_y_log10(labels = percent_format()) +
+  #scale_color_gradient(limits = c(0, 0.002), low = "blue", high = "green") +
+  theme(legend.position = "none") 
+  
+
+ggplotly(pam_dwight_words, tooltip = c("word"))
+```
+
+Words in this plot were said at least once by Dwight and Pam. The words closer to the line indicate similar word frequencies between the two characters and those farther from the line are more frequently used by one character vs. the other. For example, money, school, leave, etc. were used with similar frequencies. However, words like schrute, regional, damn, mose, etc. were used more frequently by Dwight and words like cece, paint, chairs, wedding, etc. were more frequently used by Pam.
+
+## Comparing Word Usage
+
+In addition to comparing raw word frequencies, we can determine which words were more or less likely to come from each character using the log odds ratio.
+
+```{r}
+word_ratios_dwight_pam <- tidy_tokens_no_stop %>%
+  filter(speaker %in% c("dwight", "pam")) %>% 
+  count(word, speaker) %>%
+  filter(n >= 10) %>%
+  spread(speaker, n, fill = 0) %>%
+  mutate_if(is.numeric, funs((. + 1) / sum(. + 1))) %>%
+  mutate(log_ratio = log(dwight / pam)) %>%
+  arrange(desc(log_ratio))
+```
+
+Which words have about the same likelihood of being said by Dwight and Pam? A log odds ratio near 0 means the two characters had an equal likelihood of saying a given word.
+
+```{r}
+kable(word_ratios_dwight_pam %>% 
+        arrange(abs(log_ratio)) %>% 
+        head(10), "html") %>% 
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+Dwight and Pam are both equally likely to say check, minutes, desk, and stanley.
+
+Now let's look at the words that are most likely to be said by Dwight vs. the words most likely to be said by Pam.
+
+```{r}
+word_ratios_dwight_pam %>%
+  group_by(direction = ifelse(log_ratio < 0, 'Pam', "Dwight")) %>%
+  top_n(15, abs(log_ratio)) %>%
+  ungroup() %>%
+  mutate(word = reorder(word, log_ratio)) %>%
+  ggplot(aes(word, log_ratio, color = direction)) +
+  geom_segment(aes(x = word, xend = word,
+                     y = 0, yend = log_ratio),
+                 size = 1.1, alpha = 0.6) +
+  geom_point(size = 2.5) +
+  coord_flip() +
+  theme_minimal() +
+  labs(x = NULL, 
+       y = NULL,
+       title = "Words Paired with Dwight and Pam") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.title = element_blank()) +
+  scale_y_continuous(breaks = seq(-5, 5),
+                     labels = c("32x", "16x","8x", "4x", "2x", 
+                                  "Same", "2x", "4x", "8x", "16x", "32x")) +
+  scale_color_manual(values = c("#870e1b", "#807d69"))
+```
+
+Dwight is more than eight times as likely to talk about shrute (his last name and the name of his farm, shrute farms), fire, mose (his cousin), and death whereas Pam is more likely to talk about her mom, cece (her kid), and roy (her former fiance). 
+
+## Word Relationships
+
+In addition to analyzing individual words, we can also tokenize the data by n-grams. N-grams are consecutve sequences of words, where n is the number of words in the sequence. For example, if we wanted to look at two word sequences (bigrams), we can use the `unnest_tokens()` function to do so. 
+
+```{r}
+tidy_bigrams <- mod_data %>%
+  select(line = id, line_text_mod, everything(), -line_text, -actions, -deleted) %>% 
+  unnest_tokens(bigram, line_text_mod, token = "ngrams", n = 2)
+```
+
+```{r}
+kable(tidy_bigrams %>% 
+        head(10), "html") %>% 
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+Just like with individual words, we can remove stop words from bigrams and calculate tf-idf to give us bigrams that are unique to individual characters.
+
+```{r}
+# leave stop words and calculate tf-idf
+bigram_tf_idf <- tidy_bigrams %>%
+  filter(speaker %in% main_characters, !is.na(bigram)) %>%
+  count(speaker, bigram) %>%
+  bind_tf_idf(bigram, speaker, n) %>%
+  arrange(desc(tf_idf))
+
+# remove stop words from bigrams and calculate tf-idf
+bigram_tf_idf_no_stop <- tidy_bigrams %>% 
+  filter(speaker %in% main_characters, !is.na(bigram)) %>% 
+  separate(bigram, c("word1", "word2"), sep = " ") %>%
+  filter(!word1 %in% custom_stop_words$word,
+         !word2 %in% custom_stop_words$word) %>% 
+  unite(bigram, word1, word2, sep = " ") %>% 
+  count(speaker, bigram) %>%
+  bind_tf_idf(bigram, speaker, n) %>%
+  arrange(desc(tf_idf))
+
+bigram_tf_idf %>%
+  #arrange(desc(tf_idf)) %>%
+  #mutate(word = factor(word, levels = rev(unique(word)))) %>% 
+  mutate_at(vars(speaker), factor, levels = main_characters) %>%
+  group_by(speaker) %>% 
+  top_n(10, tf_idf) %>% 
+  ungroup %>%
+  ggplot(aes(reorder_within(bigram, tf_idf, speaker), tf_idf, fill = speaker)) +
+  geom_col(show.legend = FALSE) +
+  scale_x_reordered() +
+  labs(x = NULL, y = "tf-idf") +
+  facet_wrap(~ factor(speaker, levels = main_characters), scales = "free") +
+  coord_flip() +
+  scale_fill_manual(values = office_colors)
+
+bigram_tf_idf_no_stop %>%
+  #arrange(desc(tf_idf)) %>%
+  #mutate(word = factor(word, levels = rev(unique(word)))) %>% 
+  mutate_at(vars(speaker), factor, levels = main_characters) %>%
+  group_by(speaker) %>% 
+  top_n(10, tf_idf) %>% 
+  ungroup %>%
+  ggplot(aes(reorder_within(bigram, tf_idf, speaker), tf_idf, fill = speaker)) +
+  geom_col(show.legend = FALSE) +
+  scale_x_reordered() +
+  labs(x = NULL, y = "tf-idf") +
+  facet_wrap(~ factor(speaker, levels = main_characters), scales = "free") +
+  coord_flip() +
+  scale_fill_manual(values = office_colors)
+```
+
+If we wanted to understand the relationships between words that co-occur, but aren't necessisarily right next to each other in a line, we can use the `widyr` package. The `pairwise_cor()` function gives us a measure of how frequently two words appear together relative to how frequenctly they appear separately. Here we'll explore words by scene.
+
+```{r}
+word_cors_scene <- tidy_tokens_no_stop %>%
+  unite(se_ep_sc, season, episode, scene) %>%
+  group_by(word) %>%
+  filter(n() >= 20) %>%
+  pairwise_cor(word, se_ep_sc, sort = TRUE)
+
+word_cors_scene %>%
+  filter(item1 %in% c("corporate", "scranton", "office", "love")) %>%
+  group_by(item1) %>%
+  top_n(10, correlation) %>%
+  ungroup() %>%
+  mutate(item2 = reorder(item2, correlation)) %>%
+  ggplot(aes(reorder_within(item2, correlation, item1), correlation, fill = item1)) +
+  geom_bar(stat = "identity") +
+  scale_x_reordered() +
+  facet_wrap(~ item1, scales = "free") +
+  xlab(NULL) +
+  theme(legend.position = "none") +
+  coord_flip() +
+  scale_fill_manual(values = office_colors)
+```
+
+
+```{r}
+set.seed(2016)
+
+word_cors_scene %>%
+  filter(correlation > .30) %>%
+  graph_from_data_frame() %>%
+  ggraph(layout = "fr") +
+  geom_edge_link(aes(edge_alpha = correlation), show.legend = FALSE) +
+  geom_node_point(color = "lightblue", size = 5) +
+  geom_node_text(aes(label = name), repel = TRUE) +
+  theme_void()
+```
+
+### Parts of Speech Tagging
+
+Another way to better understand word relationships is to use the `cleanNLP` package for parts of speech tagging. Essentially this package analyzes the text and determines which words are nouns, verbs, adjectives, etc. It can also return entity recognition and label nouns as people, places, organizations, etc. The `cleanNLP` offers a few different backends to perform the text annotation. I'm going to use the spaCy backend, which requires the `reticulate` package and python. Let's take a look. 
+
+```{r}
+tif_data <- mod_data %>% 
+  select(id, line_text_mod, season, episode, scene, speaker)
+
+cnlp_init_spacy()
+obj <- cnlp_annotate(tif_data, as_strings = TRUE)
+
+names(obj)
+```
+
+The resulting annotation object is a list of data frames (and one matrix), similar to a set of tables within a database.
+
+First let's look at the entities table
+
+```{r}
+ kable(head(entities), "html") %>% 
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+Here we see the entity identified and the entity type. We can join this table back to the original data by id to bring in our metadata such as speaker. From there we can again use tf-idf to see which entities were uniquely talked about by a given character.
+
+```{r}
+speaker_entities <- entities %>% 
+  left_join(speaker, by = "id") %>% 
+  filter(!(tolower(entity) %in% main_characters) & speaker %in% main_characters) %>% 
+  count(entity, speaker, sort = TRUE)
+
+tf_idf_entities <- speaker_entities %>% 
+  bind_tf_idf(entity, speaker, n)
+
+# this is somewhat interesting
+tf_idf_entities %>%
+  arrange(desc(tf_idf)) %>%
+  mutate_at(vars(speaker), factor, levels = main_characters) %>%
+  group_by(speaker) %>% 
+  top_n(10) %>% 
+  ungroup %>%
+  ggplot(aes(reorder_within(entity, tf_idf, speaker), tf_idf, fill = speaker)) +
+  geom_col(show.legend = FALSE) +
+  scale_x_reordered() +
+  labs(x = NULL, y = "tf-idf") +
+  facet_wrap(~ speaker, scales = "free") +
+  coord_flip()
+```
+
+The annotation object also has table called dependencies. 
+
+```{r}
+kable(head(dependencies), "html") %>% 
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+This provides a lot of really useful information! We can see each word, lemma, word target, and lemma target. According to wikipedia "a lemma (plural lemmas or lemmata) is the canonical form, dictionary form, or citation form of a set of words. For example, run, runs, ran and running are forms of the same lexeme, with run as the lemma." This table provides the grammatical relationship between the word/lemma and the word_target/lemma_target. From this we can get common verb noun phrases, for example.
+
+```{r}
+dobj <- dependencies %>%
+  filter(relation == "dobj") %>%
+  select(id = id, verb = word, noun = word_target) %>%
+  select(id, verb, noun) %>%
+  count(verb = tolower(verb), noun = tolower(noun), sort = TRUE)
+```
+
+What is a direct object, you ask? The direct object of a verb is the thing being acted upon (i.e., the receiver of the action). From our earlier analysis, we say that characters commonly used the words god, time, #####put some other words here. Let's try to put a little more context around these words when they are used as the direct object. 
+
+```{r}
+bubble chart plot
+```
+
+We can also look at the noun subject relationships using the dependency table. The noun subject is the noun that performs the action of the verb in a sentence. 
+
+```{r}
+nsubj <- dependencies %>% 
+  filter(relation == 'nsubj') %>%
+  rename(verb = word, noun = word_target) %>% 
+  count(noun, verb, sort = TRUE)
+
+adj <- tokens %>% 
+  mutate_at(vars(id), as.integer) %>% 
+  filter(pos == 'JJ') %>%
+  left_join(meta) %>% 
+  count(adj = tolower(word), speaker, sort = TRUE)
+
+adj %>%
+  #mutate_at(vars(speaker), factor, levels = main_characters) %>%
+  group_by(speaker) %>% 
+  top_n(10) %>% 
+  ungroup %>%
+  ggplot(aes(adj, n, fill = speaker)) +
+  geom_col(show.legend = FALSE) +
+  #scale_x_reordered() +
+  labs(x = NULL, y = "adj") +
+  facet_wrap(~ speaker, scales = "free") +
+  coord_flip()
+  
+```
+
