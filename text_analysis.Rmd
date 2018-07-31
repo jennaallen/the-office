@@ -29,6 +29,10 @@ library(kableExtra)
 library(knitr)
 library(plotly)
 library(ggcorrplot)
+library(reticulate)
+library(cleanNLP)
+library(packcircles)
+library(patchwork)
 ```
 
 # Getting and Cleaning the Data
@@ -420,7 +424,7 @@ bigram_tf_idf_no_stop <- tidy_bigrams %>%
 bigram_tf_idf %>%
   #arrange(desc(tf_idf)) %>%
   #mutate(word = factor(word, levels = rev(unique(word)))) %>% 
-  mutate_at(vars(speaker), factor, levels = main_characters) %>%
+  #mutate_at(vars(speaker), factor, levels = main_characters) %>%
   group_by(speaker) %>% 
   top_n(10, tf_idf) %>% 
   ungroup %>%
@@ -435,7 +439,7 @@ bigram_tf_idf %>%
 bigram_tf_idf_no_stop %>%
   #arrange(desc(tf_idf)) %>%
   #mutate(word = factor(word, levels = rev(unique(word)))) %>% 
-  mutate_at(vars(speaker), factor, levels = main_characters) %>%
+  #mutate_at(vars(speaker), factor, levels = main_characters) %>%
   group_by(speaker) %>% 
   top_n(10, tf_idf) %>% 
   ungroup %>%
@@ -462,7 +466,7 @@ word_cors_scene %>%
   group_by(item1) %>%
   top_n(10, correlation) %>%
   ungroup() %>%
-  mutate(item2 = reorder(item2, correlation)) %>%
+  #mutate(item2 = reorder(item2, correlation)) %>%
   ggplot(aes(reorder_within(item2, correlation, item1), correlation, fill = item1)) +
   geom_bar(stat = "identity") +
   scale_x_reordered() +
@@ -489,7 +493,7 @@ word_cors_scene %>%
 
 ### Parts of Speech Tagging
 
-Another way to better understand word relationships is to use the `cleanNLP` package for parts of speech tagging. Essentially this package analyzes the text and determines which words are nouns, verbs, adjectives, etc. It can also return entity recognition and label nouns as people, places, organizations, etc. The `cleanNLP` offers a few different backends to perform the text annotation. I'm going to use the spaCy backend, which requires the `reticulate` package and python. Let's take a look. 
+Another way to better understand word relationships is to use the `cleanNLP` package for parts of speech tagging. Essentially this package analyzes the text and determines which words are nouns, verbs, adjectives, etc. It can also perform named entity recognition which identifies entities that can be defined by proper names and categorizes them as people, locations, events, organizations, etc. The `cleanNLP` offers a few different backends to perform the text annotation. I'm going to use the spaCy backend, which requires the `reticulate` package and python. Let's take a look. 
 
 ```{r}
 tif_data <- mod_data %>% 
@@ -503,87 +507,110 @@ names(obj)
 
 The resulting annotation object is a list of data frames (and one matrix), similar to a set of tables within a database.
 
-First let's look at the entities table
+First let's look at the entities table.
 
 ```{r}
- kable(head(entities), "html") %>% 
+entities <- cnlp_get_entity(obj)
+```
+
+
+```{r echo = FALSE}
+ kable(head(entities, 10), "html") %>% 
   kable_styling(bootstrap_options = c("striped", "hover"))
 ```
 
-Here we see the entity identified and the entity type. We can join this table back to the original data by id to bring in our metadata such as speaker. From there we can again use tf-idf to see which entities were uniquely talked about by a given character.
+Here we see the entity identified and the entity type. The entity types identified here are pretty good, but we do see some mistakes, which require review and clean up. We can join this table back to the original data by id to bring in our metadata such as speaker. From there we can again use tf-idf to see which entities were uniquely talked about by a given character. I'm going to exclude any entities from the main characters list when looking at entities to see what other entities characters mentioned besides their co-workers.
 
 ```{r}
+
+meta <- mod_data %>% 
+  select(1:4, 6)
+
 speaker_entities <- entities %>% 
-  left_join(speaker, by = "id") %>% 
-  filter(!(tolower(entity) %in% main_characters) & speaker %in% main_characters) %>% 
+  mutate_at(vars(id), as.integer) %>% 
+  left_join(meta, by = "id") %>% 
+  filter( speaker %in% main_characters) %>% 
   count(entity, speaker, sort = TRUE)
 
 tf_idf_entities <- speaker_entities %>% 
   bind_tf_idf(entity, speaker, n)
 
-# this is somewhat interesting
 tf_idf_entities %>%
   arrange(desc(tf_idf)) %>%
-  mutate_at(vars(speaker), factor, levels = main_characters) %>%
+  #mutate_at(vars(speaker), factor, levels = main_characters) %>%
   group_by(speaker) %>% 
-  top_n(10) %>% 
+  top_n(10, tf_idf) %>% 
   ungroup %>%
   ggplot(aes(reorder_within(entity, tf_idf, speaker), tf_idf, fill = speaker)) +
   geom_col(show.legend = FALSE) +
   scale_x_reordered() +
   labs(x = NULL, y = "tf-idf") +
-  facet_wrap(~ speaker, scales = "free") +
-  coord_flip()
+  facet_wrap(~ factor(speaker, levels = main_characters), scales = "free") +
+  coord_flip() +
+  scale_fill_manual(values = office_colors)
+  
 ```
 
 The annotation object also has table called dependencies. 
 
 ```{r}
-kable(head(dependencies), "html") %>% 
+dependencies <- cnlp_get_dependency(obj, get_token = TRUE)
+```
+
+
+```{r}
+kable(head(dependencies, 10), "html") %>% 
   kable_styling(bootstrap_options = c("striped", "hover"))
 ```
 
-This provides a lot of really useful information! We can see each word, lemma, word target, and lemma target. According to wikipedia "a lemma (plural lemmas or lemmata) is the canonical form, dictionary form, or citation form of a set of words. For example, run, runs, ran and running are forms of the same lexeme, with run as the lemma." This table provides the grammatical relationship between the word/lemma and the word_target/lemma_target. From this we can get common verb noun phrases, for example.
+This provides a lot of really useful information! We can see each word, lemma, word target, and lemma target. According to wikipedia "a lemma (plural lemmas or lemmata) is the canonical form, dictionary form, or citation form of a set of words. For example, run, runs, ran and running are forms of the same lexeme, with run as the lemma." This table provides the grammatical relationship between the word/lemma and the word_target/lemma_target. From this we can get common verb noun phrases, for example, by filtering for the direct object relationship.
 
 ```{r}
 dobj <- dependencies %>%
   filter(relation == "dobj") %>%
-  select(id = id, verb = word, noun = word_target) %>%
+  select(id = id, verb = lemma, noun = word_target) %>%
   select(id, verb, noun) %>%
   count(verb = tolower(verb), noun = tolower(noun), sort = TRUE)
 ```
 
-What is a direct object, you ask? The direct object of a verb is the thing being acted upon (i.e., the receiver of the action). From our earlier analysis, we say that characters commonly used the words god, time, #####put some other words here. Let's try to put a little more context around these words when they are used as the direct object. 
+What is a direct object, you ask? The direct object of a verb is the thing being acted upon (i.e., the receiver of the action). From our earlier analysis, we saw that characters commonly used the words god, time, guy(s), love, and office. Let's try to put a little more context around these words when they are used as the direct object. 
 
 ```{r}
-bubble chart plot
-```
 
-We can also look at the noun subject relationships using the dependency table. The noun subject is the noun that performs the action of the verb in a sentence. 
-
-```{r}
-nsubj <- dependencies %>% 
-  filter(relation == 'nsubj') %>%
-  rename(verb = word, noun = word_target) %>% 
-  count(noun, verb, sort = TRUE)
-
-adj <- tokens %>% 
-  mutate_at(vars(id), as.integer) %>% 
-  filter(pos == 'JJ') %>%
-  left_join(meta) %>% 
-  count(adj = tolower(word), speaker, sort = TRUE)
-
-adj %>%
-  #mutate_at(vars(speaker), factor, levels = main_characters) %>%
-  group_by(speaker) %>% 
-  top_n(10) %>% 
-  ungroup %>%
-  ggplot(aes(adj, n, fill = speaker)) +
-  geom_col(show.legend = FALSE) +
-  #scale_x_reordered() +
-  labs(x = NULL, y = "adj") +
-  facet_wrap(~ speaker, scales = "free") +
-  coord_flip()
+dobj_packed_bubble <- function(data, word) {
+   
+  filtered <- data %>% 
+    filter(noun == word)
   
+  packing <- circleProgressiveLayout(filtered$n, sizetype = "area")
+  
+  verts <- circleLayoutVertices(packing, npoints = 50)
+  
+  combined <- filtered %>% 
+    bind_cols(packing)
+  
+  plot <- ggplot(data = verts) + 
+  geom_polygon(aes(x, y, group = id, fill = factor(id)), color = "black", show.legend = FALSE, alpha = 0.8) + 
+  coord_equal() + 
+  geom_text(data = combined, aes(x, y, label = ifelse(radius > .9, verb, "")), check_overlap = TRUE) +
+  theme_minimal() +
+  labs(title = str_to_title(word)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.title = element_blank(), 
+        axis.ticks = element_blank(), 
+        axis.text = element_blank()) 
+}
+
+direct_objects <- c("god", "time", "guy", "love", "office")
+plots <- setNames(map(direct_objects, ~ dobj_packed_bubble(dobj, .)), direct_objects)
+
+plots[["god"]] + plots[["time"]] + plots[["love"]] + plots[["office"]] + plot_layout(ncol = 2)
 ```
 
+We can see that when god is the direct object, someone is usually thanking god. For love, the office characters are generally talking about making, having, and finding love, so on and so forth.
+
+This post is getting fairly long, but if you've stuck with me this far, I'll just leave this here...
+
+```{r}
+
+```
